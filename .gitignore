@@ -1,2 +1,3 @@
 src/capture_ip
+test/test_parse_packet
 *.o
