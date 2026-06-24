@@ -35,11 +35,15 @@
 bool running = true;
 
 // Stop the capture loop on SIGINT/SIGTERM.
-void on_signal(int) { running = false; }
+void on_signal(int) {
+  running = false;
+}
 
 // Raise a readable exception on syscall failure.
 void die_if(bool cond, const std::string &msg) {
-  if (cond) throw std::runtime_error(msg + ": " + std::strerror(errno));
+  if (cond) {
+    throw std::runtime_error(msg + ": " + std::strerror(errno));
+  }
 }
 
 // Enable promiscuous mode on the chosen interface.
@@ -57,7 +61,11 @@ void enable_promiscuous(int fd, unsigned ifindex) {
 // after dispatch so malformed or unsupported packets can be ignored cheaply.
 ParsedPacket parse_packet(const uint8_t *packet, uint32_t len) {
   ParsedPacket result{};
-  if (len < sizeof(ethhdr)) return result;
+  // Too short for an Ethernet header; skip the frame instead of reading past
+  // the captured bytes.
+  if (len < sizeof(ethhdr)) {
+    return result;
+  }
 
   const auto *eth = reinterpret_cast<const ethhdr *>(packet);
   result.ethertype = ntohs(eth->h_proto);
@@ -121,6 +129,7 @@ bool read_ports(uint8_t proto, const uint8_t *l4, uint32_t l4_len,
     dst_port = ntohs(tcp->dest);
     return true;
   }
+  // TCP packets without a full header cannot safely expose ports.
 
   if (proto == IPPROTO_UDP && l4_len >= sizeof(udphdr)) {
     const auto *udp = reinterpret_cast<const udphdr *>(l4);
@@ -129,11 +138,16 @@ bool read_ports(uint8_t proto, const uint8_t *l4, uint32_t l4_len,
     return true;
   }
 
+  // Unsupported or truncated transports are still valid packets, but they do
+  // not have readable port fields for the summary line.
   return false;
 }
 
 void print_tcp_details(const uint8_t *l4, uint32_t l4_len) {
-  if (l4_len < sizeof(tcphdr)) return;
+  // Truncated TCP headers cannot be decoded safely.
+  if (l4_len < sizeof(tcphdr)) {
+    return;
+  }
 
   const auto *tcp = reinterpret_cast<const tcphdr *>(l4);
   std::cout << " flags [";
@@ -146,6 +160,19 @@ void print_tcp_details(const uint8_t *l4, uint32_t l4_len) {
   std::cout << "] seq " << ntohl(tcp->seq) << " ack " << ntohl(tcp->ack_seq);
 }
 
+void print_endpoint(std::ostream &out, const char *ip_label, const char *src,
+                    const char *dst, uint16_t src_port, uint16_t dst_port,
+                    bool has_ports) {
+  out << ip_label << ' ' << src;
+  if (has_ports) {
+    out << '.' << src_port;
+  }
+  out << " > " << dst;
+  if (has_ports) {
+    out << '.' << dst_port;
+  }
+}
+
 void print_transport_summary(const char *ip_label, const char *src,
                              const char *dst, uint8_t proto,
                              const uint8_t *l4, uint32_t l4_len,
@@ -155,10 +182,7 @@ void print_transport_summary(const char *ip_label, const char *src,
   uint16_t dst_port = 0;
   const bool has_ports = read_ports(proto, l4, l4_len, src_port, dst_port);
 
-  std::cout << ip_label << ' ' << src;
-  if (has_ports) std::cout << '.' << src_port;
-  std::cout << " > " << dst;
-  if (has_ports) std::cout << '.' << dst_port;
+  print_endpoint(std::cout, ip_label, src, dst, src_port, dst_port, has_ports);
 
   if (const char *name = transport_name(proto)) {
     std::cout << ' ' << name;
@@ -166,7 +190,9 @@ void print_transport_summary(const char *ip_label, const char *src,
     std::cout << " proto " << static_cast<int>(proto);
   }
 
-  if (proto == IPPROTO_TCP) print_tcp_details(l4, l4_len);
+  if (proto == IPPROTO_TCP) {
+    print_tcp_details(l4, l4_len);
+  }
 
   std::cout << ' ' << hop_label << ' ' << static_cast<int>(hop_value)
             << " len " << packet_len << '\n';
@@ -177,11 +203,18 @@ void print_transport_summary(const char *ip_label, const char *src,
 // Print a one-line IPv4 summary. The function validates IHL before touching L4
 // fields because IPv4 options make the transport offset variable.
 void parse_ipv4_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
-  if (len < l3_offset + sizeof(iphdr)) return;
+  // Need the fixed IPv4 header before we can read addresses or IHL.
+  if (len < l3_offset + sizeof(iphdr)) {
+    return;
+  }
 
   const auto *ip = reinterpret_cast<const iphdr *>(packet + l3_offset);
   const size_t ihl = static_cast<size_t>(ip->ihl) * 4;
-  if (ihl < sizeof(iphdr) || len < l3_offset + ihl) return;
+  // IPv4 options make the header longer; stop if the captured bytes do not
+  // cover the complete IP header.
+  if (ihl < sizeof(iphdr) || len < l3_offset + ihl) {
+    return;
+  }
 
   char src[INET_ADDRSTRLEN] = {};
   char dst[INET_ADDRSTRLEN] = {};
@@ -196,7 +229,10 @@ void parse_ipv4_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
 }
 
 void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
-  if (len < l3_offset + sizeof(ip6_hdr)) return;
+  // Need the full fixed IPv6 header before decoding source/destination.
+  if (len < l3_offset + sizeof(ip6_hdr)) {
+    return;
+  }
 
   const auto *ip6 = reinterpret_cast<const ip6_hdr *>(packet + l3_offset);
   char src[INET6_ADDRSTRLEN] = {};
@@ -213,6 +249,11 @@ void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
 
 void dispatch_ip_packet(const ParsedPacket &pkt, const uint8_t *packet,
                         uint32_t len) {
-  if (pkt.is_ipv4) parse_ipv4_packet(packet, len, pkt.l3_offset);
-  else if (pkt.is_ipv6) parse_ipv6_packet(packet, len, pkt.l3_offset);
+  // Non-IP frames are filtered out earlier, but keep the branch explicit to
+  // make the dispatch rules obvious.
+  if (pkt.is_ipv4) {
+    parse_ipv4_packet(packet, len, pkt.l3_offset);
+  } else if (pkt.is_ipv6) {
+    parse_ipv6_packet(packet, len, pkt.l3_offset);
+  }
 }
