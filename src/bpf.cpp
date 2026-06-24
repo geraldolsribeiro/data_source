@@ -10,8 +10,13 @@
 
 // Classic BPF filter: accept IPv4/IPv6, including VLAN-tagged frames.
 //
-//   EtherType@12 -> IPv4/IPv6 ? accept : VLAN ? inspect inner EtherType
-//                                      : reject
+//   EtherType@12 -> IPv4/IPv6 ? accept
+//                -> VLAN      ? read inner EtherType@16
+//                -> otherwise ? reject
+//
+// Filtering in the kernel lowers userspace CPU cost and reduces pressure on the
+// RX ring. This is still classic socket BPF, so the program stays a normal C++
+// userspace sniffer rather than depending on XDP/eBPF deployment.
 void attach_ip_filter(int fd) {
   sock_filter code[] = {BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 12),
                         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ETH_P_IP, 8, 0),

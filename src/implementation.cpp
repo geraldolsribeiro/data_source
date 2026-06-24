@@ -27,6 +27,8 @@
 //       |        +-- optional 4-byte tag before inner EtherType
 //       +----------- EtherType read at byte 12
 
+// Shared shutdown flag. It is intentionally simple: the signal handler only
+// changes this flag and the capture loop exits at a block boundary.
 bool running = true;
 
 // Stop the capture loop on SIGINT/SIGTERM.
@@ -47,7 +49,9 @@ void enable_promiscuous(int fd, unsigned ifindex) {
          "setsockopt PACKET_ADD_MEMBERSHIP");
 }
 
-// Read Ethernet EtherType and skip one VLAN tag when present.
+// Read Ethernet EtherType and skip one VLAN tag when present. This function
+// deliberately only performs L2 classification; deeper protocol parsing is done
+// after dispatch so malformed or unsupported packets can be ignored cheaply.
 ParsedPacket parse_packet(const uint8_t *packet, uint32_t len) {
   ParsedPacket result{};
   if (len < sizeof(ethhdr)) return result;
@@ -81,6 +85,8 @@ static const char *transport_name(uint8_t proto) {
   }
 }
 
+// Print ports when the transport header is complete enough to read safely.
+// Bounds checks are mandatory because snaplen can be shorter than wire length.
 static void print_transport_ports(uint8_t proto, const uint8_t *l4, uint32_t len) {
   if (proto == IPPROTO_TCP && len >= sizeof(tcphdr)) {
     const auto *tcp = reinterpret_cast<const tcphdr *>(l4);
@@ -91,7 +97,8 @@ static void print_transport_ports(uint8_t proto, const uint8_t *l4, uint32_t len
   }
 }
 
-// Emit a short hex preview of the payload.
+// Emit a short hex preview. Keeping it bounded avoids turning stdout into the
+// bottleneck for large packets while still providing useful diagnostics.
 static void dump_hex(const uint8_t *data, uint32_t len, uint32_t max_len = 16) {
   const uint32_t n = len < max_len ? len : max_len;
   std::cout << " |";
@@ -105,7 +112,8 @@ static void dump_hex(const uint8_t *data, uint32_t len, uint32_t max_len = 16) {
 // Output format roughly follows tcpdump: endpoint info, protocol, flags, TTL,
 // and a short hex preview of the payload.
 
-// Print a one-line IPv4 summary.
+// Print a one-line IPv4 summary. The function validates IHL before touching L4
+// fields because IPv4 options make the transport offset variable.
 void parse_ipv4_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   if (len < l3_offset + sizeof(iphdr)) return;
 
@@ -150,7 +158,8 @@ void parse_ipv4_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   std::cout << "\n";
 }
 
-// Print a one-line IPv6 summary.
+// Print a one-line IPv6 summary. This intentionally handles the base IPv6
+// header only; extension-header walking can be added later as a focused helper.
 void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   if (len < l3_offset + sizeof(ip6_hdr)) return;
 
