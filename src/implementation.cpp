@@ -4,6 +4,8 @@
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <net/if.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -47,15 +49,31 @@ ParsedPacket parse_packet(const uint8_t *packet, uint32_t len) {
 }
 
 void parse_ipv4_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
-  (void)packet;
-  (void)len;
-  (void)l3_offset;
+  if (len < l3_offset + sizeof(iphdr)) return;
+
+  const auto *ip = reinterpret_cast<const iphdr *>(packet + l3_offset);
+  char src[INET_ADDRSTRLEN] = {};
+  char dst[INET_ADDRSTRLEN] = {};
+
+  inet_ntop(AF_INET, &ip->saddr, src, sizeof(src));
+  inet_ntop(AF_INET, &ip->daddr, dst, sizeof(dst));
+
+  std::cout << "IP " << src << " > " << dst << " len " << len
+            << " proto " << static_cast<int>(ip->protocol) << "\n";
 }
 
 void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
-  (void)packet;
-  (void)len;
-  (void)l3_offset;
+  if (len < l3_offset + sizeof(ip6_hdr)) return;
+
+  const auto *ip6 = reinterpret_cast<const ip6_hdr *>(packet + l3_offset);
+  char src[INET6_ADDRSTRLEN] = {};
+  char dst[INET6_ADDRSTRLEN] = {};
+
+  inet_ntop(AF_INET6, &ip6->ip6_src, src, sizeof(src));
+  inet_ntop(AF_INET6, &ip6->ip6_dst, dst, sizeof(dst));
+
+  std::cout << "IP6 " << src << " > " << dst << " len " << len
+            << " nh " << static_cast<int>(ip6->ip6_nxt) << "\n";
 }
 
 void dispatch_ip_packet(const ParsedPacket &pkt, const uint8_t *packet,

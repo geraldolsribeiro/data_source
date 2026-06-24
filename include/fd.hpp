@@ -1,5 +1,6 @@
 #pragma once
 
+// Small RAII wrapper for a file descriptor.
 class Fd {
 public:
   explicit Fd(int fd = -1);

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
+// Minimal L2 parse result used for IP dispatch.
 struct ParsedPacket {
   uint16_t ethertype = 0;
   size_t l3_offset = 0;
