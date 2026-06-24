@@ -11,9 +11,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cctype>
 #include <cstring>
-#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -26,6 +24,11 @@
 //       ^        ^
 //       |        +-- optional 4-byte tag before inner EtherType
 //       +----------- EtherType read at byte 12
+//
+// Validation note:
+// iperf traffic is TCP or UDP, so those paths are kept small and fast. The
+// parser still keeps ICMP and other common IP protocols visible so the sniffer
+// remains general-purpose rather than iperf-only.
 
 // Shared shutdown flag. It is intentionally simple: the signal handler only
 // changes this flag and the capture loop exits at a block boundary.
@@ -55,22 +58,27 @@ void enable_promiscuous(int fd, unsigned ifindex) {
 ParsedPacket parse_packet(const uint8_t *packet, uint32_t len) {
   ParsedPacket result{};
   if (len < sizeof(ethhdr)) return result;
+
   const auto *eth = reinterpret_cast<const ethhdr *>(packet);
   result.ethertype = ntohs(eth->h_proto);
   result.l3_offset = sizeof(ethhdr);
+
   if ((result.ethertype == ETH_P_8021Q || result.ethertype == ETH_P_8021AD ||
        result.ethertype == 0x9100) &&
       len >= sizeof(ethhdr) + 4) {
     result.ethertype = ntohs(*reinterpret_cast<const uint16_t *>(packet + 16));
     result.l3_offset += 4;
   }
+
   result.is_ipv4 = result.ethertype == ETH_P_IP;
   result.is_ipv6 = result.ethertype == ETH_P_IPV6;
   return result;
 }
 
 // Map L4 protocol numbers to tcpdump-like labels.
-static const char *transport_name(uint8_t proto) {
+namespace {
+
+const char *transport_name(uint8_t proto) {
   switch (proto) {
   case IPPROTO_TCP:
     return "TCP";
@@ -80,6 +88,24 @@ static const char *transport_name(uint8_t proto) {
     return "ICMP";
   case IPPROTO_ICMPV6:
     return "ICMP6";
+  case IPPROTO_IGMP:
+    return "IGMP";
+#ifdef IPPROTO_GRE
+  case IPPROTO_GRE:
+    return "GRE";
+#endif
+#ifdef IPPROTO_ESP
+  case IPPROTO_ESP:
+    return "ESP";
+#endif
+#ifdef IPPROTO_AH
+  case IPPROTO_AH:
+    return "AH";
+#endif
+#ifdef IPPROTO_SCTP
+  case IPPROTO_SCTP:
+    return "SCTP";
+#endif
   default:
     return nullptr;
   }
@@ -87,30 +113,66 @@ static const char *transport_name(uint8_t proto) {
 
 // Print ports when the transport header is complete enough to read safely.
 // Bounds checks are mandatory because snaplen can be shorter than wire length.
-static void print_transport_ports(uint8_t proto, const uint8_t *l4, uint32_t len) {
-  if (proto == IPPROTO_TCP && len >= sizeof(tcphdr)) {
+bool read_ports(uint8_t proto, const uint8_t *l4, uint32_t l4_len,
+                uint16_t &src_port, uint16_t &dst_port) {
+  if (proto == IPPROTO_TCP && l4_len >= sizeof(tcphdr)) {
     const auto *tcp = reinterpret_cast<const tcphdr *>(l4);
-    std::cout << ntohs(tcp->source) << " > " << ntohs(tcp->dest);
-  } else if (proto == IPPROTO_UDP && len >= sizeof(udphdr)) {
+    src_port = ntohs(tcp->source);
+    dst_port = ntohs(tcp->dest);
+    return true;
+  }
+
+  if (proto == IPPROTO_UDP && l4_len >= sizeof(udphdr)) {
     const auto *udp = reinterpret_cast<const udphdr *>(l4);
-    std::cout << ntohs(udp->source) << " > " << ntohs(udp->dest);
+    src_port = ntohs(udp->source);
+    dst_port = ntohs(udp->dest);
+    return true;
   }
+
+  return false;
 }
 
-// Emit a short hex preview. Keeping it bounded avoids turning stdout into the
-// bottleneck for large packets while still providing useful diagnostics.
-static void dump_hex(const uint8_t *data, uint32_t len, uint32_t max_len = 16) {
-  const uint32_t n = len < max_len ? len : max_len;
-  std::cout << " |";
-  for (uint32_t i = 0; i < n; ++i) {
-    std::cout << ' ' << std::hex << std::setw(2) << std::setfill('0')
-              << static_cast<unsigned>(data[i]);
-  }
-  std::cout << std::dec << std::setfill(' ');
+void print_tcp_details(const uint8_t *l4, uint32_t l4_len) {
+  if (l4_len < sizeof(tcphdr)) return;
+
+  const auto *tcp = reinterpret_cast<const tcphdr *>(l4);
+  std::cout << " flags [";
+  if (tcp->fin) std::cout << "F";
+  if (tcp->syn) std::cout << "S";
+  if (tcp->rst) std::cout << "R";
+  if (tcp->psh) std::cout << "P";
+  if (tcp->ack) std::cout << "A";
+  if (tcp->urg) std::cout << "U";
+  std::cout << "] seq " << ntohl(tcp->seq) << " ack " << ntohl(tcp->ack_seq);
 }
 
-// Output format roughly follows tcpdump: endpoint info, protocol, flags, TTL,
-// and a short hex preview of the payload.
+void print_transport_summary(const char *ip_label, const char *src,
+                             const char *dst, uint8_t proto,
+                             const uint8_t *l4, uint32_t l4_len,
+                             uint32_t packet_len, const char *hop_label,
+                             uint8_t hop_value) {
+  uint16_t src_port = 0;
+  uint16_t dst_port = 0;
+  const bool has_ports = read_ports(proto, l4, l4_len, src_port, dst_port);
+
+  std::cout << ip_label << ' ' << src;
+  if (has_ports) std::cout << '.' << src_port;
+  std::cout << " > " << dst;
+  if (has_ports) std::cout << '.' << dst_port;
+
+  if (const char *name = transport_name(proto)) {
+    std::cout << ' ' << name;
+  } else {
+    std::cout << " proto " << static_cast<int>(proto);
+  }
+
+  if (proto == IPPROTO_TCP) print_tcp_details(l4, l4_len);
+
+  std::cout << ' ' << hop_label << ' ' << static_cast<int>(hop_value)
+            << " len " << packet_len << '\n';
+}
+
+} // namespace
 
 // Print a one-line IPv4 summary. The function validates IHL before touching L4
 // fields because IPv4 options make the transport offset variable.
@@ -129,37 +191,10 @@ void parse_ipv4_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   const uint8_t *l4 = packet + l3_offset + ihl;
   const uint32_t l4_len = len - static_cast<uint32_t>(l3_offset + ihl);
 
-  std::cout << "IP " << src;
-  if (transport_name(ip->protocol)) {
-    std::cout << ".";
-    print_transport_ports(ip->protocol, l4, l4_len);
-  }
-  std::cout << " > " << dst;
-
-  if (const char *name = transport_name(ip->protocol)) {
-    std::cout << " " << name;
-    if (ip->protocol == IPPROTO_TCP && l4_len >= sizeof(tcphdr)) {
-      const auto *tcp = reinterpret_cast<const tcphdr *>(l4);
-      std::cout << " flags [";
-      if (tcp->fin) std::cout << "F";
-      if (tcp->syn) std::cout << "S";
-      if (tcp->rst) std::cout << "R";
-      if (tcp->psh) std::cout << "P";
-      if (tcp->ack) std::cout << "A";
-      if (tcp->urg) std::cout << "U";
-      std::cout << "] seq " << ntohl(tcp->seq) << " ack " << ntohl(tcp->ack_seq);
-    }
-  } else {
-    std::cout << " proto " << static_cast<int>(ip->protocol);
-  }
-
-  std::cout << " ttl " << static_cast<int>(ip->ttl) << " len " << len;
-  if (l4_len > 0) dump_hex(l4, l4_len);
-  std::cout << "\n";
+  print_transport_summary("IP", src, dst, ip->protocol, l4, l4_len, len, "ttl",
+                          ip->ttl);
 }
 
-// Print a one-line IPv6 summary. This intentionally handles the base IPv6
-// header only; extension-header walking can be added later as a focused helper.
 void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   if (len < l3_offset + sizeof(ip6_hdr)) return;
 
@@ -172,19 +207,10 @@ void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   const uint8_t *l4 = packet + l3_offset + sizeof(ip6_hdr);
   const uint32_t l4_len = len - static_cast<uint32_t>(l3_offset + sizeof(ip6_hdr));
 
-  std::cout << "IP6 " << src << " > " << dst;
-  if (const char *name = transport_name(ip6->ip6_nxt)) {
-    std::cout << " " << name << " ";
-    print_transport_ports(ip6->ip6_nxt, l4, l4_len);
-  } else {
-    std::cout << " nh " << static_cast<int>(ip6->ip6_nxt);
-  }
-  std::cout << " hlim " << static_cast<int>(ip6->ip6_hlim) << " len " << len;
-  if (l4_len > 0) dump_hex(l4, l4_len);
-  std::cout << "\n";
+  print_transport_summary("IP6", src, dst, ip6->ip6_nxt, l4, l4_len, len,
+                          "hlim", ip6->ip6_hlim);
 }
 
-// Route the packet to the right IP parser.
 void dispatch_ip_packet(const ParsedPacket &pkt, const uint8_t *packet,
                         uint32_t len) {
   if (pkt.is_ipv4) parse_ipv4_packet(packet, len, pkt.l3_offset);

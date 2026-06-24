@@ -123,7 +123,7 @@ TEST_CASE("parse_ipv4_packet prints a tcpdump-like line") {
   pkt[37] = 0x35;
 
   const auto out = capture_stdout(parse_ipv4_packet, pkt.data(), pkt.size(), 14);
-  CHECK(out.find("IP 1.2.3.4.8080 > 53 > 5.6.7.8") != std::string::npos);
+  CHECK(out.find("IP 1.2.3.4.8080 > 5.6.7.8.53") != std::string::npos);
   CHECK(out.find("UDP") != std::string::npos);
 }
 
@@ -153,6 +153,26 @@ TEST_CASE("parse_ipv6_packet prints a tcpdump-like line") {
   const auto out = capture_stdout(parse_ipv6_packet, pkt.data(), pkt.size(), 14);
   CHECK(out.find("IP6") != std::string::npos);
   CHECK(out.find("hlim 64") != std::string::npos);
+}
+
+TEST_CASE("parse_ipv4_packet prints ICMP summaries") {
+  std::array<uint8_t, 14 + 20 + 8> pkt{};
+  pkt[12] = 0x08;
+  pkt[13] = 0x00;
+  pkt[14] = 0x45;
+  pkt[22] = 64;
+  pkt[23] = 1;
+  pkt[26] = 192;
+  pkt[27] = 0;
+  pkt[28] = 2;
+  pkt[29] = 1;
+  pkt[30] = 198;
+  pkt[31] = 51;
+  pkt[32] = 100;
+  pkt[33] = 2;
+
+  const auto out = capture_stdout(parse_ipv4_packet, pkt.data(), pkt.size(), 14);
+  CHECK(out.find("IP 192.0.2.1 > 198.51.100.2 ICMP") != std::string::npos);
 }
 
 TEST_CASE("parse_ipv4_packet prints TCP details") {
@@ -191,7 +211,7 @@ TEST_CASE("parse_ipv4_packet prints TCP details") {
   CHECK(out.find("ack 0") != std::string::npos);
 }
 
-TEST_CASE("parse_ipv4_packet prints a hex preview") {
+TEST_CASE("parse_ipv4_packet prints a compact UDP line") {
   std::array<uint8_t, 14 + 20 + 12> pkt{};
   pkt[12] = 0x08;
   pkt[13] = 0x00;
@@ -219,5 +239,5 @@ TEST_CASE("parse_ipv4_packet prints a hex preview") {
   pkt[45] = 0x22;
 
   const auto out = capture_stdout(parse_ipv4_packet, pkt.data(), pkt.size(), 14);
-  CHECK(out.find("| 1f 90 00 35 aa bb cc dd") != std::string::npos);
+  CHECK(out.find("IP 1.1.1.1.8080 > 2.2.2.2.53 UDP") != std::string::npos);
 }

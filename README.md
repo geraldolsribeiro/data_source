@@ -53,7 +53,7 @@ The program reads `PACKET_STATISTICS` on shutdown. These counters are essential 
 - `src/main.cpp` — argument handling and top-level orchestration
 - `src/capture.cpp` — socket setup, RX ring setup, polling, block processing
 - `src/bpf.cpp` — kernel-side IPv4/IPv6 filter
-- `src/implementation.cpp` — Ethernet/VLAN/IP parsing and summary output
+- `src/implementation.cpp` — Ethernet/VLAN/IP parsing and summary output for TCP, UDP, ICMP, and other common IP protocols
 - `src/fd.cpp` — RAII file descriptor wrapper
 - `src/parsed_packet.cpp` — packet metadata type
 
