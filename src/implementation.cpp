@@ -18,14 +18,26 @@
 #include <stdexcept>
 #include <string>
 
+// Packet layout:
+//
+//   +--------+---------+---------+---------+----------+
+//   | ETH    | VLAN?   | IP      | L4      | payload  |
+//   +--------+---------+---------+---------+----------+
+//       ^        ^
+//       |        +-- optional 4-byte tag before inner EtherType
+//       +----------- EtherType read at byte 12
+
 bool running = true;
 
+// Stop the capture loop on SIGINT/SIGTERM.
 void on_signal(int) { running = false; }
 
+// Raise a readable exception on syscall failure.
 void die_if(bool cond, const std::string &msg) {
   if (cond) throw std::runtime_error(msg + ": " + std::strerror(errno));
 }
 
+// Enable promiscuous mode on the chosen interface.
 void enable_promiscuous(int fd, unsigned ifindex) {
   packet_mreq mreq{};
   mreq.mr_ifindex = static_cast<int>(ifindex);
@@ -35,6 +47,7 @@ void enable_promiscuous(int fd, unsigned ifindex) {
          "setsockopt PACKET_ADD_MEMBERSHIP");
 }
 
+// Read Ethernet EtherType and skip one VLAN tag when present.
 ParsedPacket parse_packet(const uint8_t *packet, uint32_t len) {
   ParsedPacket result{};
   if (len < sizeof(ethhdr)) return result;
@@ -52,6 +65,7 @@ ParsedPacket parse_packet(const uint8_t *packet, uint32_t len) {
   return result;
 }
 
+// Map L4 protocol numbers to tcpdump-like labels.
 static const char *transport_name(uint8_t proto) {
   switch (proto) {
   case IPPROTO_TCP:
@@ -77,6 +91,7 @@ static void print_transport_ports(uint8_t proto, const uint8_t *l4, uint32_t len
   }
 }
 
+// Emit a short hex preview of the payload.
 static void dump_hex(const uint8_t *data, uint32_t len, uint32_t max_len = 16) {
   const uint32_t n = len < max_len ? len : max_len;
   std::cout << " |";
@@ -87,6 +102,10 @@ static void dump_hex(const uint8_t *data, uint32_t len, uint32_t max_len = 16) {
   std::cout << std::dec << std::setfill(' ');
 }
 
+// Output format roughly follows tcpdump: endpoint info, protocol, flags, TTL,
+// and a short hex preview of the payload.
+
+// Print a one-line IPv4 summary.
 void parse_ipv4_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   if (len < l3_offset + sizeof(iphdr)) return;
 
@@ -131,6 +150,7 @@ void parse_ipv4_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   std::cout << "\n";
 }
 
+// Print a one-line IPv6 summary.
 void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   if (len < l3_offset + sizeof(ip6_hdr)) return;
 
@@ -155,6 +175,7 @@ void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   std::cout << "\n";
 }
 
+// Route the packet to the right IP parser.
 void dispatch_ip_packet(const ParsedPacket &pkt, const uint8_t *packet,
                         uint32_t len) {
   if (pkt.is_ipv4) parse_ipv4_packet(packet, len, pkt.l3_offset);

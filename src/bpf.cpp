@@ -8,6 +8,10 @@
 
 #include <cstddef>
 
+// Classic BPF filter: accept IPv4/IPv6, including VLAN-tagged frames.
+//
+//   EtherType@12 -> IPv4/IPv6 ? accept : VLAN ? inspect inner EtherType
+//                                      : reject
 void attach_ip_filter(int fd) {
   sock_filter code[] = {BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 12),
                         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ETH_P_IP, 8, 0),

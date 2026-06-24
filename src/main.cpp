@@ -9,6 +9,14 @@
 #include <stdexcept>
 #include <string>
 
+// End-to-end flow:
+//
+//   [argv] -> [main] -> [capture.cpp] -> [bpf.cpp] -> [RX ring] -> [parsers]
+//                |           |              |            |
+//                |           |              |            +--> implementation.cpp
+//                |           |              +-----------------> attach_ip_filter()
+//                |           +-------------------------------> create/configure loop
+//                +-------------------------------------------> Fd RAII wrapper
 int main(int argc, char **argv) {
   try {
     if (argc != 2) {
