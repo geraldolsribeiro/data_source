@@ -6,10 +6,14 @@
 #include <net/if.h>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -48,18 +52,83 @@ ParsedPacket parse_packet(const uint8_t *packet, uint32_t len) {
   return result;
 }
 
+static const char *transport_name(uint8_t proto) {
+  switch (proto) {
+  case IPPROTO_TCP:
+    return "TCP";
+  case IPPROTO_UDP:
+    return "UDP";
+  case IPPROTO_ICMP:
+    return "ICMP";
+  case IPPROTO_ICMPV6:
+    return "ICMP6";
+  default:
+    return nullptr;
+  }
+}
+
+static void print_transport_ports(uint8_t proto, const uint8_t *l4, uint32_t len) {
+  if (proto == IPPROTO_TCP && len >= sizeof(tcphdr)) {
+    const auto *tcp = reinterpret_cast<const tcphdr *>(l4);
+    std::cout << ntohs(tcp->source) << " > " << ntohs(tcp->dest);
+  } else if (proto == IPPROTO_UDP && len >= sizeof(udphdr)) {
+    const auto *udp = reinterpret_cast<const udphdr *>(l4);
+    std::cout << ntohs(udp->source) << " > " << ntohs(udp->dest);
+  }
+}
+
+static void dump_hex(const uint8_t *data, uint32_t len, uint32_t max_len = 16) {
+  const uint32_t n = len < max_len ? len : max_len;
+  std::cout << " |";
+  for (uint32_t i = 0; i < n; ++i) {
+    std::cout << ' ' << std::hex << std::setw(2) << std::setfill('0')
+              << static_cast<unsigned>(data[i]);
+  }
+  std::cout << std::dec << std::setfill(' ');
+}
+
 void parse_ipv4_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   if (len < l3_offset + sizeof(iphdr)) return;
 
   const auto *ip = reinterpret_cast<const iphdr *>(packet + l3_offset);
+  const size_t ihl = static_cast<size_t>(ip->ihl) * 4;
+  if (ihl < sizeof(iphdr) || len < l3_offset + ihl) return;
+
   char src[INET_ADDRSTRLEN] = {};
   char dst[INET_ADDRSTRLEN] = {};
-
   inet_ntop(AF_INET, &ip->saddr, src, sizeof(src));
   inet_ntop(AF_INET, &ip->daddr, dst, sizeof(dst));
 
-  std::cout << "IP " << src << " > " << dst << " len " << len
-            << " proto " << static_cast<int>(ip->protocol) << "\n";
+  const uint8_t *l4 = packet + l3_offset + ihl;
+  const uint32_t l4_len = len - static_cast<uint32_t>(l3_offset + ihl);
+
+  std::cout << "IP " << src;
+  if (transport_name(ip->protocol)) {
+    std::cout << ".";
+    print_transport_ports(ip->protocol, l4, l4_len);
+  }
+  std::cout << " > " << dst;
+
+  if (const char *name = transport_name(ip->protocol)) {
+    std::cout << " " << name;
+    if (ip->protocol == IPPROTO_TCP && l4_len >= sizeof(tcphdr)) {
+      const auto *tcp = reinterpret_cast<const tcphdr *>(l4);
+      std::cout << " flags [";
+      if (tcp->fin) std::cout << "F";
+      if (tcp->syn) std::cout << "S";
+      if (tcp->rst) std::cout << "R";
+      if (tcp->psh) std::cout << "P";
+      if (tcp->ack) std::cout << "A";
+      if (tcp->urg) std::cout << "U";
+      std::cout << "] seq " << ntohl(tcp->seq) << " ack " << ntohl(tcp->ack_seq);
+    }
+  } else {
+    std::cout << " proto " << static_cast<int>(ip->protocol);
+  }
+
+  std::cout << " ttl " << static_cast<int>(ip->ttl) << " len " << len;
+  if (l4_len > 0) dump_hex(l4, l4_len);
+  std::cout << "\n";
 }
 
 void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
@@ -68,12 +137,22 @@ void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   const auto *ip6 = reinterpret_cast<const ip6_hdr *>(packet + l3_offset);
   char src[INET6_ADDRSTRLEN] = {};
   char dst[INET6_ADDRSTRLEN] = {};
-
   inet_ntop(AF_INET6, &ip6->ip6_src, src, sizeof(src));
   inet_ntop(AF_INET6, &ip6->ip6_dst, dst, sizeof(dst));
 
-  std::cout << "IP6 " << src << " > " << dst << " len " << len
-            << " nh " << static_cast<int>(ip6->ip6_nxt) << "\n";
+  const uint8_t *l4 = packet + l3_offset + sizeof(ip6_hdr);
+  const uint32_t l4_len = len - static_cast<uint32_t>(l3_offset + sizeof(ip6_hdr));
+
+  std::cout << "IP6 " << src << " > " << dst;
+  if (const char *name = transport_name(ip6->ip6_nxt)) {
+    std::cout << " " << name << " ";
+    print_transport_ports(ip6->ip6_nxt, l4, l4_len);
+  } else {
+    std::cout << " nh " << static_cast<int>(ip6->ip6_nxt);
+  }
+  std::cout << " hlim " << static_cast<int>(ip6->ip6_hlim) << " len " << len;
+  if (l4_len > 0) dump_hex(l4, l4_len);
+  std::cout << "\n";
 }
 
 void dispatch_ip_packet(const ParsedPacket &pkt, const uint8_t *packet,
