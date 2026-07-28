@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -35,9 +36,7 @@
 bool running = true;
 
 // Stop the capture loop on SIGINT/SIGTERM.
-void on_signal(int) {
-  running = false;
-}
+void on_signal(int) { running = false; }
 
 // Raise a readable exception on syscall failure.
 void die_if(bool cond, const std::string &msg) {
@@ -151,19 +150,26 @@ void print_tcp_details(const uint8_t *l4, uint32_t l4_len) {
 
   const auto *tcp = reinterpret_cast<const tcphdr *>(l4);
   std::cout << " flags [";
-  if (tcp->fin) std::cout << "F";
-  if (tcp->syn) std::cout << "S";
-  if (tcp->rst) std::cout << "R";
-  if (tcp->psh) std::cout << "P";
-  if (tcp->ack) std::cout << "A";
-  if (tcp->urg) std::cout << "U";
+  if (tcp->fin)
+    std::cout << "F";
+  if (tcp->syn)
+    std::cout << "S";
+  if (tcp->rst)
+    std::cout << "R";
+  if (tcp->psh)
+    std::cout << "P";
+  if (tcp->ack)
+    std::cout << "A";
+  if (tcp->urg)
+    std::cout << "U";
   std::cout << "] seq " << ntohl(tcp->seq) << " ack " << ntohl(tcp->ack_seq);
 }
 
 void print_endpoint(std::ostream &out, const char *ip_label, const char *src,
                     const char *dst, uint16_t src_port, uint16_t dst_port,
                     bool has_ports) {
-  out << ip_label << ' ' << src;
+  static size_t counter{0};
+  out << counter++ << ' ' << ip_label << ' ' << src;
   if (has_ports) {
     out << '.' << src_port;
   }
@@ -174,10 +180,9 @@ void print_endpoint(std::ostream &out, const char *ip_label, const char *src,
 }
 
 void print_transport_summary(const char *ip_label, const char *src,
-                             const char *dst, uint8_t proto,
-                             const uint8_t *l4, uint32_t l4_len,
-                             uint32_t packet_len, const char *hop_label,
-                             uint8_t hop_value) {
+                             const char *dst, uint8_t proto, const uint8_t *l4,
+                             uint32_t l4_len, uint32_t packet_len,
+                             const char *hop_label, uint8_t hop_value) {
   uint16_t src_port = 0;
   uint16_t dst_port = 0;
   const bool has_ports = read_ports(proto, l4, l4_len, src_port, dst_port);
@@ -194,8 +199,39 @@ void print_transport_summary(const char *ip_label, const char *src,
     print_tcp_details(l4, l4_len);
   }
 
-  std::cout << ' ' << hop_label << ' ' << static_cast<int>(hop_value)
-            << " len " << packet_len << '\n';
+  std::cout << ' ' << hop_label << ' ' << static_cast<int>(hop_value) << " len "
+            << packet_len << '\n';
+}
+
+} // namespace
+
+size_t aggregated_buffer_size{0};
+size_t max_aggregated_buffer_size{65300};
+const size_t pdu_size{11200};
+size_t avg_packets_per_aggregation{25};
+size_t packet_no{0};
+
+namespace {
+
+constexpr size_t kPaddingHistorySize = 200;
+size_t padding_history[kPaddingHistorySize]{};
+size_t padding_history_count{0};
+size_t padding_history_index{0};
+
+void record_padding(size_t padding) {
+  padding_history[padding_history_index] = padding;
+  padding_history_index = (padding_history_index + 1) % kPaddingHistorySize;
+  if (padding_history_count < kPaddingHistorySize) {
+    ++padding_history_count;
+  }
+}
+
+size_t padding_history_sum() {
+  size_t sum = 0;
+  for (size_t i = 0; i < padding_history_count; ++i) {
+    sum += padding_history[i];
+  }
+  return sum;
 }
 
 } // namespace
@@ -221,11 +257,44 @@ void parse_ipv4_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   inet_ntop(AF_INET, &ip->saddr, src, sizeof(src));
   inet_ntop(AF_INET, &ip->daddr, dst, sizeof(dst));
 
-  const uint8_t *l4 = packet + l3_offset + ihl;
-  const uint32_t l4_len = len - static_cast<uint32_t>(l3_offset + ihl);
+  const bool packet_limited = packet_no >= avg_packets_per_aggregation;
+  const bool buffer_limited =
+      (aggregated_buffer_size + len) >= max_aggregated_buffer_size;
+  if (packet_limited || buffer_limited) {
+    size_t agg_size = aggregated_buffer_size;
+    size_t num_full_pdu{0};
+    while (agg_size >= pdu_size) {
+      num_full_pdu++;
+      agg_size -= pdu_size;
+    }
+    const auto padding = pdu_size - agg_size;
+    const auto padding_percent = aggregated_buffer_size == 0
+                                     ? 0
+                                     : padding * 100 / aggregated_buffer_size;
+    record_padding(padding);
+    std::cout << packet_limited << " " << buffer_limited << " "
+              << avg_packets_per_aggregation << ' ' << num_full_pdu
+              << " PDUs + " << agg_size << "B + " << padding << "B padding "
+              << padding_percent << "% of " << aggregated_buffer_size
+              << " history_sum=" << padding_history_sum() << " " << len
+              << std::endl;
 
-  print_transport_summary("IP", src, dst, ip->protocol, l4, l4_len, len, "ttl",
-                          ip->ttl);
+    packet_no = 0;
+    aggregated_buffer_size = 0;
+    if (buffer_limited) {
+      avg_packets_per_aggregation--;
+    } else if (aggregated_buffer_size < 0.7 * max_aggregated_buffer_size) {
+      avg_packets_per_aggregation++;
+    }
+  }
+
+  aggregated_buffer_size += 2; // size
+  aggregated_buffer_size += len;
+  packet_no++;
+
+  // print_transport_summary("IP", src, dst, ip->protocol, l4, l4_len, len,
+  // "ttl",
+  //                         ip->ttl);
 }
 
 void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
@@ -241,7 +310,8 @@ void parse_ipv6_packet(const uint8_t *packet, uint32_t len, size_t l3_offset) {
   inet_ntop(AF_INET6, &ip6->ip6_dst, dst, sizeof(dst));
 
   const uint8_t *l4 = packet + l3_offset + sizeof(ip6_hdr);
-  const uint32_t l4_len = len - static_cast<uint32_t>(l3_offset + sizeof(ip6_hdr));
+  const uint32_t l4_len =
+      len - static_cast<uint32_t>(l3_offset + sizeof(ip6_hdr));
 
   print_transport_summary("IP6", src, dst, ip6->ip6_nxt, l4, l4_len, len,
                           "hlim", ip6->ip6_hlim);
